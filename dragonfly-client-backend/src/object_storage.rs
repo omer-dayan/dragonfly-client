@@ -692,6 +692,7 @@ impl crate::Backend for ObjectStorage {
             http_status_code: None,
             error_message: None,
             entries,
+                body: None,
         })
     }
 

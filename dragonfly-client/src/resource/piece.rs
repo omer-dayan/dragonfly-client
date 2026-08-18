@@ -15,6 +15,7 @@
  */
 
 use super::*;
+use bytes::Bytes;
 use chrono::Utc;
 use dragonfly_api::common::v2::{Hdfs, HuggingFace, ModelScope, ObjectStorage, Range, TrafficType};
 use dragonfly_client_backend::{BackendFactory, GetRequest};
@@ -36,6 +37,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
+use futures::stream;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt};
 use tracing::{debug, error, instrument, warn, Span};
 
@@ -485,6 +487,7 @@ impl Piece {
         length: u64,
         request_header: HeaderMap,
         expected_response_header: Option<HeaderMap>,
+        expected_response_body: Option<Bytes>,
         is_prefetch: bool,
         object_storage: Option<ObjectStorage>,
         hdfs: Option<Hdfs>,
@@ -530,6 +533,45 @@ impl Piece {
         self.download_bandwidth_limiter
             .acquire(length as usize)
             .await;
+
+        // A signature-bound range's stat request already fetched this exact Range from
+        // the origin (it could not be downgraded to a cheap probe without invalidating
+        // the signature). If those bytes were handed to us, use them directly instead
+        // of fetching the same signed Range from the origin a second time.
+        //
+        // This skips `validate_signature_bound_response` below: that check exists to
+        // catch the origin object changing between the stat call and a second,
+        // independent GET, and there is no second GET here to validate against. The
+        // bytes are trusted as a single response, already checked once against the
+        // task's recorded Content-Range/Content-Length/ETag when the task was created.
+        if let Some(body) = expected_response_body.filter(|body| {
+            body.len() as u64 == length && signature_bound_range(&request_header, url).is_some()
+        }) {
+            let mut stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body) });
+            return match self
+                .storage
+                .download_piece_from_source_finished(
+                    piece_id,
+                    task_id,
+                    offset,
+                    length,
+                    &mut stream,
+                    self.config.storage.write_piece_timeout,
+                )
+                .await
+            {
+                Ok(piece) => {
+                    collect_download_piece_traffic_metrics(&TrafficType::BackToSource, length);
+
+                    scopeguard::ScopeGuard::into_inner(guard);
+                    Ok(piece)
+                }
+                Err(err) => {
+                    error!("download piece finished: {}", err);
+                    Err(err)
+                }
+            };
+        }
 
         // Download the piece from the source.
         let backend = self.backend_factory.build(url).inspect_err(|err| {

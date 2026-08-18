@@ -393,6 +393,7 @@ impl Backend for ModelScope {
                             http_status_code: None,
                             entries: Vec::new(),
                             error_message: Some(err.to_string()),
+                                                body: None,
                         });
                     }
                 };
@@ -421,6 +422,7 @@ impl Backend for ModelScope {
                     http_status_code: Some(response_status_code),
                     error_message: Some(response_status_code.to_string()),
                     entries: Vec::new(),
+                                body: None,
                 })
             }
             None => {
@@ -448,6 +450,7 @@ impl Backend for ModelScope {
                             http_status_code: None,
                             entries: Vec::new(),
                             error_message: Some(err.to_string()),
+                                                body: None,
                         });
                     }
                 };
@@ -467,6 +470,7 @@ impl Backend for ModelScope {
                         http_status_code: response_status_code.into(),
                         error_message: Some(response_status_code.to_string()),
                         entries: Vec::new(),
+                                        body: None,
                     });
                 }
 
@@ -543,6 +547,7 @@ impl Backend for ModelScope {
                     http_status_code: Some(response_status_code),
                     error_message: Some(response_status_code.to_string()),
                     entries,
+                                body: None,
                 })
             }
         }

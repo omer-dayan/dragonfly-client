@@ -47,6 +47,8 @@ use dragonfly_client_metric::{
     collect_backend_request_started_metrics,
 };
 use dragonfly_client_storage::{metadata, Storage};
+use bytes::Bytes;
+use dashmap::DashMap;
 use dragonfly_client_util::{
     http::{
         get_content_range, get_content_range_from_hashmap, hashmap_to_headermap,
@@ -105,6 +107,18 @@ pub struct Task {
 
     /// The parent selector.
     pub parent_selector: Arc<ParentSelector>,
+
+    /// Holds the body already read while statting a signature-bound range, keyed by
+    /// task id, so the piece download can reuse it instead of fetching the same
+    /// signed Range from the origin a second time.
+    ///
+    /// `download_started` and the later piece download run as separate calls with no
+    /// other shared state between them, so the bytes have to be handed off here. An
+    /// entry is consumed (removed) by the first piece download that reads it; entries
+    /// left behind by a task whose download never proceeds are bounded in both size
+    /// (`piece::MAX_SIGNATURE_BOUND_RANGE_LENGTH` per entry) and count (one per
+    /// in-flight signature-bound task id).
+    signature_bound_stat_bodies: Arc<DashMap<String, Bytes>>,
 }
 
 /// Implements the task manager.
@@ -143,6 +157,7 @@ impl Task {
                 shutdown.clone(),
                 shutdown_complete_tx.clone(),
             )),
+            signature_bound_stat_bodies: Arc::new(DashMap::new()),
         })
     }
 
@@ -312,6 +327,18 @@ impl Task {
                     content_range.range.length,
                     piece::MAX_SIGNATURE_BOUND_RANGE_LENGTH
                 )));
+            }
+
+            // The stat request above already fetched this exact signed Range from the
+            // origin (it could not be downgraded to a cheap probe without invalidating
+            // the signature). Hand the bytes off so the piece download can reuse them
+            // instead of fetching the same signed Range a second time. Only trust a
+            // body whose length matches the validated Content-Range; anything else is
+            // dropped here and the piece download falls back to fetching it for real.
+            if let Some(body) = response.body.clone() {
+                if body.len() as u64 == content_range.range.length {
+                    self.signature_bound_stat_bodies.insert(id.to_string(), body);
+                }
             }
 
             content_range.range.length
@@ -1722,6 +1749,14 @@ impl Task {
             } else {
                 None
             };
+        // Consume (remove) the body buffered while statting this task, if any. This is
+        // the only piece-fetch pass for a signature-bound task, so it's the only place
+        // that could reuse it; consuming here bounds the map to one entry per in-flight
+        // signature-bound task.
+        let expected_response_body = self
+            .signature_bound_stat_bodies
+            .remove(task_id)
+            .map(|(_, body)| body);
 
         // Initialize the finished pieces.
         let mut finished_pieces: Vec<metadata::Piece> = Vec::new();
@@ -1742,6 +1777,7 @@ impl Task {
                 length: u64,
                 request_header: HeaderMap,
                 expected_response_header: Option<HeaderMap>,
+                expected_response_body: Option<Bytes>,
                 is_prefetch: bool,
                 need_piece_content: bool,
                 piece_manager: Arc<piece::Piece>,
@@ -1765,6 +1801,7 @@ impl Task {
                         length,
                         request_header,
                         expected_response_header,
+                        expected_response_body,
                         is_prefetch,
                         object_storage,
                         hdfs,
@@ -1889,6 +1926,7 @@ impl Task {
             let url = request.url.clone();
             let request_header = request_header.clone();
             let expected_response_header = expected_response_header.clone();
+            let expected_response_body = expected_response_body.clone();
             let piece_manager = self.piece.clone();
             let download_progress_tx = download_progress_tx.clone();
             let in_stream_tx = in_stream_tx.clone();
@@ -1910,6 +1948,7 @@ impl Task {
                         interested_piece.length,
                         request_header,
                         expected_response_header,
+                        expected_response_body,
                         request.is_prefetch,
                         request.need_piece_content,
                         piece_manager,
@@ -2301,6 +2340,14 @@ impl Task {
             } else {
                 None
             };
+        // Consume (remove) the body buffered while statting this task, if any. This is
+        // the only piece-fetch pass for a signature-bound task, so it's the only place
+        // that could reuse it; consuming here bounds the map to one entry per in-flight
+        // signature-bound task.
+        let expected_response_body = self
+            .signature_bound_stat_bodies
+            .remove(task_id)
+            .map(|(_, body)| body);
 
         // Initialize the finished pieces.
         let mut finished_pieces: Vec<metadata::Piece> = Vec::new();
@@ -2321,6 +2368,7 @@ impl Task {
                 length: u64,
                 request_header: HeaderMap,
                 expected_response_header: Option<HeaderMap>,
+                expected_response_body: Option<Bytes>,
                 is_prefetch: bool,
                 need_piece_content: bool,
                 piece_manager: Arc<piece::Piece>,
@@ -2343,6 +2391,7 @@ impl Task {
                         length,
                         request_header,
                         expected_response_header,
+                        expected_response_body,
                         is_prefetch,
                         object_storage,
                         hdfs,
@@ -2446,6 +2495,7 @@ impl Task {
             let url = request.url.clone();
             let request_header = request_header.clone();
             let expected_response_header = expected_response_header.clone();
+            let expected_response_body = expected_response_body.clone();
             let piece_manager = self.piece.clone();
             let download_progress_tx = download_progress_tx.clone();
             let object_storage = request.object_storage.clone();
@@ -2466,6 +2516,7 @@ impl Task {
                         interested_piece.length,
                         request_header,
                         expected_response_header,
+                        expected_response_body,
                         request.is_prefetch,
                         request.need_piece_content,
                         piece_manager,

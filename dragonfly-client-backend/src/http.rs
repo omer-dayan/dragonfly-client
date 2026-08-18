@@ -50,6 +50,7 @@ use crate::{
     StatRequest, StatResponse, DEFAULT_USER_AGENT, KEEP_ALIVE_INTERVAL, POOL_MAX_IDLE_PER_HOST,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use dashmap::{mapref::entry::Entry, DashMap};
 use dragonfly_api::common::v2::Range;
 use dragonfly_client_core::{
@@ -89,6 +90,16 @@ pub const HTTPS_SCHEME: &str = "https";
 
 /// The user agent header.
 pub const USER_AGENT_HEADER: &str = "user-agent";
+
+/// The maximum length of a signature-bound range response to buffer during stat, so
+/// the bytes can be reused by the piece download instead of re-fetching the same
+/// signed Range from the origin a second time.
+///
+/// Must stay in sync with `dragonfly_client::resource::piece::MAX_SIGNATURE_BOUND_RANGE_LENGTH`,
+/// which rejects any signature-bound task above this size before a piece download is
+/// ever attempted. Buffering beyond that limit here would only hold memory for a
+/// request that is going to be rejected downstream anyway.
+const MAX_BUFFERED_STAT_BODY_LENGTH: u64 = 1024 * 1024 * 1024;
 
 /// Stores a temporary redirect entry with its creation time.
 #[derive(Clone, Debug)]
@@ -484,6 +495,7 @@ impl Backend for HTTP {
                                 http_status_code: None,
                                 entries: Vec::new(),
                                 error_message: Some(err.to_string()),
+                                                        body: None,
                             });
                         }
                     }
@@ -502,6 +514,7 @@ impl Backend for HTTP {
                         error_message: Some(
                             "got 307 Temporary Redirect without Location header".to_string(),
                         ),
+                                        body: None,
                     });
                 }
             }
@@ -539,6 +552,7 @@ impl Backend for HTTP {
                             http_status_code: None,
                             entries: Vec::new(),
                             error_message: Some(err.to_string()),
+                                                body: None,
                         });
                     }
                 }
@@ -579,6 +593,7 @@ impl Backend for HTTP {
                             http_status_code: None,
                             entries: Vec::new(),
                             error_message: Some(err.to_string()),
+                                                body: None,
                         });
                     }
                 }
@@ -597,6 +612,7 @@ impl Backend for HTTP {
                     http_status_code: None,
                     entries: Vec::new(),
                     error_message: None,
+                                body: None,
                 });
             }
         };
@@ -608,6 +624,7 @@ impl Backend for HTTP {
         } else {
             None
         };
+        let mut body: Option<Bytes> = None;
         let content_length = if response_status_code == reqwest::StatusCode::PARTIAL_CONTENT {
             // The total length of a ranged response is in the Content-Range header,
             // e.g. "bytes 0-0/1048576".
@@ -621,9 +638,27 @@ impl Backend for HTTP {
             }
 
             if preserve_range {
-                // A signature-bound range may be large. Do not download it once for
-                // stat and then again for the actual piece request.
-                drop(response);
+                // A signature-bound range must reach the origin unchanged, so this
+                // request already carries the full range, not a cheap one-byte probe.
+                // Read it here and hand the bytes to the caller, so the piece download
+                // can reuse them instead of fetching the same signed Range again.
+                let range_length = content_range.map(|range| range.range.length);
+                if range_length.is_some_and(|length| length <= MAX_BUFFERED_STAT_BODY_LENGTH) {
+                    match response.bytes().await {
+                        Ok(bytes) => body = Some(bytes),
+                        Err(err) => {
+                            debug!(
+                                "stat request failed to read signature-bound response body {} {}: {}",
+                                request.task_id, request_url, err
+                            );
+                        }
+                    }
+                } else {
+                    // Too large to safely buffer here (or the range length could not be
+                    // determined). Fall back to the old behavior: discard the body now
+                    // and let the piece download fetch it for real.
+                    drop(response);
+                }
             } else {
                 // Read the one-byte body to completion, so the connection can be reused
                 // by the connection pool instead of being closed with an unread body.
@@ -673,6 +708,7 @@ impl Backend for HTTP {
             http_status_code: Some(response_status_code),
             error_message: Some(response_status_code.to_string()),
             entries: Vec::new(),
+            body,
         })
     }
 

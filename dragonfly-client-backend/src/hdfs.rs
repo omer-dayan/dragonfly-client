@@ -194,6 +194,7 @@ impl Backend for Hdfs {
             http_status_code: None,
             error_message: None,
             entries,
+                body: None,
         })
     }
 

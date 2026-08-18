@@ -108,7 +108,7 @@ pub struct StatRequest {
 }
 
 /// The stat response for backend.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct StatResponse {
     /// The success of the response.
     pub success: bool,
@@ -127,6 +127,11 @@ pub struct StatResponse {
 
     /// The error message of the response.
     pub error_message: Option<String>,
+
+    /// The body of the response, populated only when the caller has already read it
+    /// (currently: a signature-bound Range stat, so the piece download can reuse the
+    /// bytes instead of re-fetching the same signed Range from the origin).
+    pub body: Option<Bytes>,
 }
 
 /// The get request for backend.
