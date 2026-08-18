@@ -547,7 +547,10 @@ impl Piece {
         if let Some(body) = expected_response_body.filter(|body| {
             body.len() as u64 == length && signature_bound_range(&request_header, url).is_some()
         }) {
-            let mut stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body) });
+            // `stream::iter` (not `stream::once`, which wraps a `Future` and is
+            // therefore `!Unpin`) since the bytes are already in hand and there is
+            // nothing to await; `download_piece_from_source_finished` requires `Unpin`.
+            let mut stream = stream::iter(std::iter::once(Ok::<Bytes, std::io::Error>(body)));
             return match self
                 .storage
                 .download_piece_from_source_finished(
